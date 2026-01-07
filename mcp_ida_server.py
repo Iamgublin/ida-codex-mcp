@@ -92,7 +92,7 @@ def handle_initialize(req: dict):
             },
             "serverInfo": {
                 "name": "ida-mcp",
-                "version": "0.1.3",
+                "version": "0.2.1",
             },
         },
     }
@@ -122,7 +122,7 @@ def handle_tools_list(req: dict):
         },
         {
             "name": "ida_analyze_function",
-            "description": "Analyze a function to guess its role based on called functions. Optionally rename the function in IDA. Use ida_list_functions to get valid function names.",
+            "description": "Analyze a function to guess its role based on called functions. Returns analysis results WITHOUT renaming by default. Use ida_list_functions to get valid function names. IMPORTANT: Only set rename=true when explicitly asked to rename the function.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -138,12 +138,12 @@ def handle_tools_list(req: dict):
                     "rename": {
                         "type": "boolean",
                         "default": False,
-                        "description": "Whether to rename the function in IDA based on analysis"
+                        "description": "CAUTION: Set to true ONLY when user explicitly requests renaming. Default false means analysis only, no modifications to IDA database."
                     },
                     "rename_locals": {
                         "type": "boolean",
                         "default": False,
-                        "description": "Whether to also rename local variables"
+                        "description": "CAUTION: Set to true ONLY when user explicitly requests renaming local variables. Requires rename=true."
                     },
                 },
                 "required": ["name"],
@@ -329,6 +329,97 @@ def handle_tools_list(req: dict):
                     },
                 },
                 "required": [],
+            },
+        },
+        {
+            "name": "ida_jump_to_address",
+            "description": "Jump to a specific address in IDA (similar to pressing 'g' and entering address). Useful for navigating to function pointers or data locations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "description": "Target address to jump to (in decimal)"
+                    },
+                },
+                "required": ["address"],
+            },
+        },
+        {
+            "name": "ida_set_data_type",
+            "description": "Set the data type at a specific address (byte, word, dword, qword, etc.). Similar to pressing 'D' then type key in IDA.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "description": "Address to set data type for (in decimal)"
+                    },
+                    "data_type": {
+                        "type": "string",
+                        "enum": ["byte", "word", "dword", "qword", "float", "double", "ascii", "unicode"],
+                        "description": "Data type to set (byte=1, word=2, dword=4, qword=8 bytes)"
+                    },
+                },
+                "required": ["address", "data_type"],
+            },
+        },
+        {
+            "name": "ida_set_function_pointer_type",
+            "description": "Set a function pointer type at a specific address (similar to pressing 'Y' in IDA). This helps Hex-Rays recognize function pointers and display proper function calls instead of MEMORY[address]. FIXED: Now supports simplified signatures.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "description": "Address to set function pointer type for (in decimal)"
+                    },
+                    "function_signature": {
+                        "type": "string",
+                        "description": "Function signature. Supports simplified formats: 'NTSTATUS', 'NTSTATUS __fastcall', etc. Also accepts full signatures like 'NTSTATUS (__fastcall *)(void *a1, void *a2, int a3, int a4, int a5)'"
+                    },
+                },
+                "required": ["address", "function_signature"],
+            },
+        },
+        {
+            "name": "ida_set_name",
+            "description": "Set a name for an address (similar to pressing 'N' in IDA). INTELLIGENT: Automatically detects function pointers and sets proper QWORD data type + function pointer type, making Hex-Rays display function calls correctly instead of MEMORY[address]. Useful for naming function pointers, variables, or functions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "description": "Address to name (in decimal)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New name for the address (e.g., 'MmIsAddressValid', 'ExAllocatePool', 'g_ApiPointer')"
+                    },
+                },
+                "required": ["address", "name"],
+            },
+        },
+        {
+            "name": "ida_create_function_pointer",
+            "description": "Complete workflow: convert MEMORY[address] calls to named function calls. This combines jump, set qword data type, set function pointer type, and naming in one operation. FIXED: Now supports simplified signatures like 'NTSTATUS __fastcall'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "integer",
+                        "description": "Address of the function pointer (in decimal)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Function name (e.g., 'PsLookupSomething')"
+                    },
+                    "function_signature": {
+                        "type": "string",
+                        "description": "Function signature. Supports simplified formats: 'NTSTATUS', 'NTSTATUS __fastcall', 'HANDLE', etc. Also accepts full signatures like 'NTSTATUS (__fastcall *)(void *, void *, int, int, int)'"
+                    },
+                },
+                "required": ["address", "name", "function_signature"],
             },
         },
     ]
@@ -853,6 +944,184 @@ def handle_tools_call(req: dict):
             
             if has_more:
                 lines.append(f"Use offset={offset + count} to get next page")
+            
+            ok("\n".join(lines), meta=data)
+
+        elif tool_name == "ida_jump_to_address":
+            address = args.get("address")
+            if address is None:
+                err("address required")
+                return
+            
+            try:
+                address = int(address)
+            except Exception:
+                err("address must be an integer")
+                return
+            
+            data = ida_request("jump_to_address", address=address)
+            if "error" in data:
+                err("jump_to_address failed: " + data["error"])
+                return
+            
+            ok(f"Jumped to address {hex(address)}")
+
+        elif tool_name == "ida_set_data_type":
+            address = args.get("address")
+            data_type = args.get("data_type")
+            
+            if address is None or data_type is None:
+                err("address and data_type required")
+                return
+            
+            try:
+                address = int(address)
+            except Exception:
+                err("address must be an integer")
+                return
+            
+            data = ida_request("set_data_type", address=address, data_type=data_type)
+            if "error" in data:
+                err("set_data_type failed: " + data["error"])
+                return
+            
+            ok(f"Set data type '{data_type}' at address {hex(address)}")
+
+        elif tool_name == "ida_set_function_pointer_type":
+            address = args.get("address")
+            function_signature = args.get("function_signature")
+            
+            if address is None or function_signature is None:
+                err("address and function_signature required")
+                return
+            
+            try:
+                address = int(address)
+            except Exception:
+                err("address must be an integer")
+                return
+            
+            data = ida_request("set_function_pointer_type", address=address, function_signature=function_signature)
+            if "error" in data:
+                err("set_function_pointer_type failed: " + data["error"])
+                return
+            
+            ok(f"Set function pointer type at address {hex(address)}: {function_signature}")
+
+        elif tool_name == "ida_set_name":
+            address = args.get("address")
+            name = args.get("name")
+            
+            if address is None or name is None:
+                err("address and name required")
+                return
+            
+            try:
+                address = int(address)
+            except Exception:
+                err("address must be an integer")
+                return
+            
+            data = ida_request("set_name", address=address, name=name)
+            if "error" in data:
+                error_msg = data["error"]
+                # 如果是地址未映射的错误，尝试先创建 segment
+                if "is not mapped" in error_msg:
+                    log(f"[ida-mcp] Address not mapped, attempting to create segment at {hex(address)}")
+                    
+                    # 创建 segment
+                    segment_name = f"seg_{hex(address)[2:].upper()}"
+                    create_result = ida_request("create_segment", address=address, name=segment_name, size=0x10000)
+                    
+                    if "error" not in create_result:
+                        log(f"[ida-mcp] Successfully created segment, retrying set_name")
+                        # 重新尝试设置名称
+                        retry_data = ida_request("set_name", address=address, name=name)
+                        if "error" in retry_data:
+                            err("set_name failed after creating segment: " + retry_data["error"])
+                            return
+                        else:
+                            ok(f"Set name '{name}' at address {hex(address)} (created segment {segment_name})")
+                            return
+                    else:
+                        log(f"[ida-mcp] Failed to create segment: {create_result['error']}")
+                        err("set_name failed: " + error_msg + " (and failed to create segment: " + create_result["error"] + ")")
+                        return
+                else:
+                    err("set_name failed: " + error_msg)
+                    return
+            
+            # 构建响应消息
+            final_name = data.get("name", name)
+            response_lines = [f"Set name '{final_name}' at address {hex(address)}"]
+            
+            # 添加自动处理信息
+            auto_proc = data.get("auto_processing")
+            if auto_proc and isinstance(auto_proc, dict):
+                # 显示名称冲突处理
+                if "name_conflict" in auto_proc:
+                    response_lines.append(f"\n⚠ {auto_proc['name_conflict']}")
+                    if "name_resolution" in auto_proc:
+                        response_lines.append(f"  → Resolution: {auto_proc['name_resolution']}")
+                
+                # 显示指针值
+                if "pointer_value" in auto_proc:
+                    response_lines.append(f"\nPointer value: {auto_proc['pointer_value']}")
+                
+                # 显示段创建信息
+                if "segment_created" in auto_proc:
+                    seg_info = auto_proc["segment_created"]
+                    response_lines.append(f"\n✓ Created segment for target address:")
+                    response_lines.append(f"  → Segment name: {seg_info['name']}")
+                    response_lines.append(f"  → Range: {seg_info['start']} - {seg_info['end']}")
+                
+                # 显示检测结果
+                detected = auto_proc.get("detected")
+                if detected and "pointer" in detected:
+                    response_lines.append(f"\n✓ Auto-detected: {detected}")
+                    if "target_function" in auto_proc:
+                        response_lines.append(f"  → Points to function: {auto_proc['target_function']}")
+                    if "data_type" in auto_proc:
+                        response_lines.append(f"  → Data type set to: {auto_proc['data_type']}")
+                    if "function_type" in auto_proc:
+                        response_lines.append(f"  → Function type applied: {auto_proc['function_type']}")
+                    response_lines.append("\n✓ Hex-Rays should now display function calls using the name instead of MEMORY[address]")
+            
+            ok("\n".join(response_lines), meta=data)
+
+        elif tool_name == "ida_create_function_pointer":
+            address = args.get("address")
+            name = args.get("name")
+            function_signature = args.get("function_signature")
+            
+            if address is None or name is None or function_signature is None:
+                err("address, name and function_signature required")
+                return
+            
+            try:
+                address = int(address)
+            except Exception:
+                err("address must be an integer")
+                return
+            
+            data = ida_request("create_function_pointer", address=address, name=name, function_signature=function_signature)
+            if "error" in data:
+                err("create_function_pointer failed: " + data["error"])
+                return
+            
+            lines = [
+                f"Successfully created function pointer at {hex(address)}:",
+                f"Name: {name}",
+                f"Type: {function_signature}",
+                "",
+                "Operations performed:",
+                "1. Jumped to address",
+                "2. Set data type to QWORD",
+                "3. Applied function pointer type",
+                "4. Set name",
+                "",
+                "Hex-Rays should now display function calls using the name instead of MEMORY[address]."
+            ]
             
             ok("\n".join(lines), meta=data)
 

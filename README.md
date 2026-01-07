@@ -2,7 +2,7 @@
 
 Local MCP (Model Context Protocol) server plus an IDA 9.2 plugin to expose common reverse engineering capabilities to MCP clients.
 
-- `ida_bridge.py`: an IDA plugin that exposes core analysis features (function list, call graph, Hex-Rays pseudocode, disassembly, imports/exports, xrefs, strings, memory reads, etc.) over a local TCP JSON interface (default `127.0.0.1:31337`).
+- `ida_bridge.py`: an IDA plugin that exposes core analysis features (function list, call graph, Hex-Rays pseudocode, disassembly, imports/exports, xrefs, strings, memory reads, navigation, naming/typing helpers, etc.) over a local TCP JSON interface (default `127.0.0.1:31337`).
 - `mcp_ida_server.py`: a local MCP server that talks to the IDA plugin, then re-exposes features as MCP tools and resources over STDIN/STDOUT so MCP clients (e.g., Codex CLI) can use them directly.
 
 
@@ -24,6 +24,12 @@ Local MCP (Model Context Protocol) server plus an IDA 9.2 plugin to expose commo
   - Globals: `ida_list_globals(offset, count)`
   - Memory read: `ida_read_memory(address, size)`
   - Strings: `ida_get_strings(min_length, offset, count)`
+- Navigation & typing
+  - Jump to address: `ida_jump_to_address(address)`
+  - Set data type: `ida_set_data_type(address, data_type)` (byte/word/dword/qword/float/double/ascii/unicode)
+  - Set function pointer type: `ida_set_function_pointer_type(address, function_signature)` (supports simplified signatures like `NTSTATUS __fastcall`)
+  - Smart name: `ida_set_name(address, name)` (auto-detects function pointers and applies QWORD + function type)
+  - Create function pointer: `ida_create_function_pointer(address, name, function_signature)` (jump + QWORD + function type + name; supports simplified signatures)
 - MCP resources
   - `resources/list`: export top functions as resources (first 500)
   - `resources/read`: fetch pseudocode (or fallback to disassembly) via `ida://function/{ea}/{name}`

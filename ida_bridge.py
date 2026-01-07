@@ -34,6 +34,52 @@ PORT = 31337
 
 # ---------- 工具函数 ----------
 
+def _normalize_function_signature(signature):
+    """
+    规范化函数签名，处理常见的格式问题
+    """
+    sig = signature.strip()
+    
+    # 常见的函数签名模板
+    templates = {
+        # Windows API 常见类型
+        "NTSTATUS": "NTSTATUS (*func)(void*, void*, int, int, int);",
+        "HANDLE": "HANDLE (*func)(void*, void*, int, int, int);",
+        "BOOL": "BOOL (*func)(void*, void*, int, int, int);", 
+        "DWORD": "DWORD (*func)(void*, void*, int, int, int);",
+        "PVOID": "PVOID (*func)(void*, void*, int, int, int);",
+        
+        # 通用类型
+        "int": "int (*func)(void*, void*, int, int, int);",
+        "void": "void (*func)(void*, void*, int, int, int);",
+        "void*": "void* (*func)(void*, void*, int, int, int);",
+        "long": "long (*func)(void*, void*, int, int, int);",
+        "uint64_t": "uint64_t (*func)(void*, void*, int, int, int);",
+    }
+    
+    # 如果是简单的类型名，使用模板
+    if sig in templates:
+        return templates[sig]
+    
+    # 如果已经是完整的函数指针声明，直接返回
+    if "(*" in sig or "(__" in sig:
+        # 确保以分号结尾
+        if not sig.endswith(';'):
+            sig += ';'
+        return sig
+    
+    # 尝试解析为返回类型 + 调用约定的形式
+    # 例如: "NTSTATUS __fastcall" -> "NTSTATUS (__fastcall *func)(...)"
+    parts = sig.split()
+    if len(parts) >= 2:
+        return_type = parts[0]
+        calling_conv = parts[1]
+        return f"{return_type} ({calling_conv} *func)(void*, void*, int, int, int);"
+    
+    # 默认情况：假设是返回类型
+    return f"{sig} (*func)(void*, void*, int, int, int);"
+
+
 def _is_call(ea):
     try:
         return idaapi.is_call_insn(ea)
@@ -621,6 +667,448 @@ def _get_strings(min_length=4, offset=0, count=100):
     }
 
 
+def _jump_to_address(address):
+    """
+    跳转到指定地址（类似按 g 键）
+    """
+    try:
+        ea = int(address)
+    except Exception:
+        return {"error": "address must be an integer"}
+    
+    # 检查地址是否有效
+    if not idaapi.is_mapped(ea):
+        return {"error": f"address {hex(ea)} is not mapped"}
+    
+    # 跳转到地址
+    idaapi.jumpto(ea)
+    
+    return {
+        "address": ea,
+        "hex_address": hex(ea),
+        "ok": True
+    }
+
+
+def _set_data_type(address, data_type):
+    """
+    设置指定地址的数据类型
+    """
+    try:
+        ea = int(address)
+    except Exception:
+        return {"error": "address must be an integer"}
+    
+    if not idaapi.is_mapped(ea):
+        return {"error": f"address {hex(ea)} is not mapped"}
+    
+    # 先删除现有数据
+    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE)
+    
+    # 根据类型设置数据
+    success = False
+    if data_type == "byte":
+        success = ida_bytes.create_data(ea, ida_bytes.FF_BYTE, 1, idaapi.BADADDR)
+    elif data_type == "word":
+        success = ida_bytes.create_data(ea, ida_bytes.FF_WORD, 2, idaapi.BADADDR)
+    elif data_type == "dword":
+        success = ida_bytes.create_data(ea, ida_bytes.FF_DWORD, 4, idaapi.BADADDR)
+    elif data_type == "qword":
+        success = ida_bytes.create_data(ea, ida_bytes.FF_QWORD, 8, idaapi.BADADDR)
+    elif data_type == "float":
+        success = ida_bytes.create_data(ea, ida_bytes.FF_FLOAT, 4, idaapi.BADADDR)
+    elif data_type == "double":
+        success = ida_bytes.create_data(ea, ida_bytes.FF_DOUBLE, 8, idaapi.BADADDR)
+    elif data_type == "ascii":
+        success = ida_bytes.create_strlit(ea, 0, ida_nalt.STRTYPE_C)
+    elif data_type == "unicode":
+        success = ida_bytes.create_strlit(ea, 0, ida_nalt.STRTYPE_C_16)
+    else:
+        return {"error": f"unsupported data type: {data_type}"}
+    
+    if not success:
+        return {"error": f"failed to set data type {data_type} at {hex(ea)}"}
+    
+    return {
+        "address": ea,
+        "hex_address": hex(ea),
+        "data_type": data_type,
+        "ok": True
+    }
+
+
+def _set_function_pointer_type(address, function_signature):
+    """
+    设置函数指针类型（类似按 Y 键）
+    """
+    try:
+        ea = int(address)
+    except Exception:
+        return {"error": "address must be an integer"}
+    
+    if not idaapi.is_mapped(ea):
+        return {"error": f"address {hex(ea)} is not mapped"}
+    
+    # 先设置为 QWORD 类型（函数指针通常是 8 字节）
+    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE)
+    if not ida_bytes.create_data(ea, ida_bytes.FF_QWORD, 8, idaapi.BADADDR):
+        return {"error": f"failed to set qword data at {hex(ea)}"}
+    
+    # 设置类型信息
+    try:
+        tinfo = idaapi.tinfo_t()
+        
+        # 规范化函数签名
+        sig = _normalize_function_signature(function_signature)
+        if not sig:
+            return {"error": "empty function signature"}
+        
+        # 尝试解析类型 - 使用正确的参数
+        til = idaapi.get_idati()
+        if idaapi.parse_decl(tinfo, til, sig, idaapi.PT_TYP | idaapi.PT_SIL):
+            # 成功解析，设置类型信息
+            if ida_nalt.set_tinfo(ea, tinfo):
+                return {
+                    "address": ea,
+                    "hex_address": hex(ea),
+                    "function_signature": function_signature,
+                    "parsed_signature": sig,
+                    "ok": True
+                }
+            else:
+                return {"error": f"failed to set type info at {hex(ea)}"}
+        else:
+            # 解析失败，尝试一些通用的函数指针类型
+            generic_sigs = [
+                "void* (*func)();",
+                "int (*func)();",
+                "void (*func)();",
+                "NTSTATUS (*func)();"
+            ]
+            
+            for generic_sig in generic_sigs:
+                if idaapi.parse_decl(tinfo, til, generic_sig, idaapi.PT_TYP | idaapi.PT_SIL):
+                    if ida_nalt.set_tinfo(ea, tinfo):
+                        return {
+                            "address": ea,
+                            "hex_address": hex(ea),
+                            "function_signature": function_signature,
+                            "fallback_signature": generic_sig,
+                            "warning": f"Original signature failed, used fallback: {generic_sig}",
+                            "ok": True
+                        }
+            
+            return {"error": f"failed to parse function signature: {function_signature}"}
+        
+    except Exception as e:
+        return {"error": f"failed to set function pointer type: {e}"}
+
+
+def _create_segment(address, size=0x1000, name="created_seg", seg_class="DATA"):
+    """
+    创建一个新的 segment
+    """
+    try:
+        ea = int(address)
+        size = int(size)
+    except Exception:
+        return {"error": "address and size must be integers"}
+    
+    # 页对齐起始地址
+    aligned_start = ea & ~0xFFF
+    # 计算结束地址，确保包含目标地址
+    end_ea = max(aligned_start + size, ea + 0x100)
+    # 页对齐结束地址
+    aligned_end = (end_ea + 0xFFF) & ~0xFFF
+    
+    try:
+        # 创建 segment
+        seg = idaapi.segment_t()
+        seg.start_ea = aligned_start
+        seg.end_ea = aligned_end
+        seg.bitness = 1  # 64-bit
+        seg.perm = idaapi.SEGPERM_READ | idaapi.SEGPERM_WRITE
+        
+        # 设置 segment 类型
+        if seg_class.upper() == "CODE":
+            seg.type = idaapi.SEG_CODE
+            seg.perm |= idaapi.SEGPERM_EXEC
+        else:
+            seg.type = idaapi.SEG_DATA
+        
+        # 添加 segment
+        if idaapi.add_segm_ex(seg, name, seg_class, idaapi.ADDSEG_SPARSE):
+            return {
+                "address": ea,
+                "hex_address": hex(ea),
+                "segment_start": aligned_start,
+                "segment_end": aligned_end,
+                "segment_name": name,
+                "ok": True
+            }
+        else:
+            return {"error": f"failed to create segment at {hex(aligned_start)}"}
+    except Exception as e:
+        return {"error": f"failed to create segment: {e}"}
+
+
+def _set_name(address, name):
+    """
+    设置地址的名字（类似按 N 键）
+    智能处理：如果地址处存储的是函数指针，自动设置为 QWORD 并应用函数指针类型
+    如果函数指针指向的目标地址无效，先为目标地址创建 segment
+    """
+    try:
+        ea = int(address)
+    except Exception:
+        return {"error": "address must be an integer"}
+    
+    if not idaapi.is_mapped(ea):
+        return {"error": f"address {hex(ea)} is not mapped"}
+    
+    results = {}
+    
+    # 读取地址处的值，检查是否是函数指针
+    try:
+        # 尝试读取 8 字节（64位指针）
+        ptr_value = ida_bytes.get_qword(ea)
+        if ptr_value and ptr_value != idaapi.BADADDR:
+            results["pointer_value"] = hex(ptr_value)
+            
+            # 检查目标地址是否已映射
+            target_mapped = idaapi.is_mapped(ptr_value)
+            if not target_mapped:
+                # 目标地址未映射，尝试创建 segment
+                results["target_not_mapped"] = f"target address {hex(ptr_value)} not mapped"
+                
+                segment_name = f"seg_{hex(ptr_value)[2:].upper()}"
+                seg_result = _create_segment(ptr_value, size=0x10000, name=segment_name, seg_class="CODE")
+                
+                if "error" not in seg_result:
+                    results["segment_created"] = {
+                        "name": segment_name,
+                        "start": hex(seg_result.get("segment_start", 0)),
+                        "end": hex(seg_result.get("segment_end", 0))
+                    }
+                    # 重新检查是否映射成功
+                    target_mapped = idaapi.is_mapped(ptr_value)
+                else:
+                    results["segment_creation_failed"] = seg_result["error"]
+            
+            # 检查该值是否指向一个函数（或在新创建的 segment 中）
+            target_func = ida_funcs.get_func(ptr_value)
+            if target_func:
+                results["detected"] = f"function pointer to {hex(ptr_value)}"
+                results["target_function"] = ida_funcs.get_func_name(target_func.start_ea)
+            elif target_mapped:
+                # 即使不是函数，但目标地址已映射，也当作函数指针处理
+                results["detected"] = f"pointer to {hex(ptr_value)} (may be function)"
+                
+            # 如果检测到指针（不管目标是否是函数），都进行处理
+            if "detected" in results or target_mapped:
+                # 1. 设置为 QWORD 数据类型
+                try:
+                    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE)
+                    if ida_bytes.create_data(ea, ida_bytes.FF_QWORD, 8, idaapi.BADADDR):
+                        results["data_type"] = "qword"
+                    else:
+                        results["data_type"] = "failed to set qword"
+                except Exception as e:
+                    results["data_type"] = f"error: {e}"
+                
+                # 2. 尝试设置函数指针类型（使用通用签名）
+                try:
+                    tinfo = idaapi.tinfo_t()
+                    til = idaapi.get_idati()
+                    
+                    # 尝试多种通用函数指针类型
+                    generic_sigs = [
+                        "void* (*func)();",
+                        "NTSTATUS (*func)();",
+                        "int (*func)();",
+                        "long (*func)();",
+                    ]
+                    
+                    type_set = False
+                    for sig in generic_sigs:
+                        if idaapi.parse_decl(tinfo, til, sig, idaapi.PT_TYP | idaapi.PT_SIL):
+                            if ida_nalt.set_tinfo(ea, tinfo):
+                                results["function_type"] = sig
+                                type_set = True
+                                break
+                    
+                    if not type_set:
+                        results["function_type"] = "failed to set"
+                except Exception as e:
+                    results["function_type"] = f"error: {e}"
+                
+                # 3. 刷新视图
+                try:
+                    ida_kernwin.refresh_idaview_anyway()
+                    if HAS_HEXRAYS:
+                        ida_hexrays.refresh_hexrays_view()
+                except Exception:
+                    pass
+            else:
+                results["detected"] = f"not a function pointer (points to {hex(ptr_value)})"
+    except Exception as e:
+        results["detection_error"] = str(e)
+    
+    # 设置名字 - 处理名称冲突
+    final_name = name
+    name_set = False
+    
+    # 首先检查名称是否已存在
+    existing_ea = ida_name.get_name_ea(idaapi.BADADDR, name)
+    if existing_ea != idaapi.BADADDR and existing_ea != ea:
+        # 名称已被使用在其他地址
+        results["name_conflict"] = f"name '{name}' already used at {hex(existing_ea)}"
+        
+        # 尝试使用带后缀的名称
+        for i in range(1, 100):
+            candidate_name = f"{name}_{i}"
+            test_ea = ida_name.get_name_ea(idaapi.BADADDR, candidate_name)
+            if test_ea == idaapi.BADADDR or test_ea == ea:
+                # 这个名称可用
+                if ida_name.set_name(ea, candidate_name, ida_name.SN_AUTO):
+                    final_name = candidate_name
+                    name_set = True
+                    results["name_resolution"] = f"used alternate name: {candidate_name}"
+                    break
+        
+        if not name_set:
+            # 如果所有后缀都失败，尝试使用 SN_NOWARN 强制设置
+            if ida_name.set_name(ea, name, ida_name.SN_NOWARN | ida_name.SN_AUTO):
+                name_set = True
+                results["name_resolution"] = "forced name with SN_NOWARN"
+            else:
+                return {
+                    "error": f"failed to set name '{name}' at {hex(ea)} - name already used at {hex(existing_ea)}",
+                    "existing_address": hex(existing_ea),
+                    "auto_processing": results
+                }
+    else:
+        # 名称未被使用或已经是当前地址的名称
+        if ida_name.set_name(ea, name, ida_name.SN_AUTO):
+            name_set = True
+        else:
+            # 尝试使用 SN_NOWARN
+            if ida_name.set_name(ea, name, ida_name.SN_NOWARN | ida_name.SN_AUTO):
+                name_set = True
+                results["name_resolution"] = "set with SN_NOWARN"
+            else:
+                return {"error": f"failed to set name '{name}' at {hex(ea)}"}
+    
+    return {
+        "address": ea,
+        "hex_address": hex(ea),
+        "name": final_name,
+        "auto_processing": results if results else "none (not a function pointer)",
+        "ok": True
+    }
+
+
+def _create_function_pointer(address, name, function_signature):
+    """
+    完整的函数指针创建流程：跳转、设置 QWORD、设置类型、命名
+    """
+    try:
+        ea = int(address)
+    except Exception:
+        return {"error": "address must be an integer"}
+    
+    if not idaapi.is_mapped(ea):
+        return {"error": f"address {hex(ea)} is not mapped"}
+    
+    results = {}
+    
+    # 1. 跳转到地址
+    try:
+        idaapi.jumpto(ea)
+        results["jump"] = True
+    except Exception as e:
+        results["jump"] = f"failed: {e}"
+    
+    # 2. 设置为 QWORD 数据类型
+    try:
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE)
+        if ida_bytes.create_data(ea, ida_bytes.FF_QWORD, 8, idaapi.BADADDR):
+            results["data_type"] = "qword set successfully"
+        else:
+            results["data_type"] = "failed to set qword"
+    except Exception as e:
+        results["data_type"] = f"failed: {e}"
+    
+    # 3. 设置函数指针类型
+    try:
+        tinfo = idaapi.tinfo_t()
+        til = idaapi.get_idati()
+        
+        # 规范化函数签名
+        sig = _normalize_function_signature(function_signature)
+        
+        if idaapi.parse_decl(tinfo, til, sig, idaapi.PT_TYP | idaapi.PT_SIL):
+            if ida_nalt.set_tinfo(ea, tinfo):
+                results["function_type"] = f"set successfully: {sig}"
+            else:
+                results["function_type"] = "parsed but failed to set"
+        else:
+            # 尝试通用类型
+            generic_sigs = [
+                "void* (*func)();",
+                "int (*func)();", 
+                "void (*func)();",
+                "NTSTATUS (*func)();"
+            ]
+            
+            success = False
+            for generic_sig in generic_sigs:
+                if idaapi.parse_decl(tinfo, til, generic_sig, idaapi.PT_TYP | idaapi.PT_SIL):
+                    if ida_nalt.set_tinfo(ea, tinfo):
+                        results["function_type"] = f"set generic type: {generic_sig} (original failed: {function_signature})"
+                        success = True
+                        break
+            
+            if not success:
+                results["function_type"] = f"failed to parse: {function_signature}"
+    except Exception as e:
+        results["function_type"] = f"failed: {e}"
+    
+    # 4. 设置名字
+    try:
+        if ida_name.set_name(ea, name, ida_name.SN_AUTO):
+            results["name"] = f"set to '{name}'"
+        else:
+            results["name"] = f"failed to set '{name}'"
+    except Exception as e:
+        results["name"] = f"failed: {e}"
+    
+    # 刷新显示
+    try:
+        # 刷新 IDA 视图
+        ida_kernwin.refresh_idaview_anyway()
+        
+        # 如果有 Hex-Rays，也刷新反编译视图
+        if HAS_HEXRAYS:
+            try:
+                ida_hexrays.refresh_hexrays_view()
+            except Exception:
+                pass  # 忽略 Hex-Rays 刷新失败
+        
+        results["refresh"] = "views refreshed"
+    except Exception as e:
+        results["refresh"] = f"refresh failed: {e}"
+    
+    return {
+        "address": ea,
+        "hex_address": hex(ea),
+        "name": name,
+        "function_signature": function_signature,
+        "results": results,
+        "ok": True
+    }
+
+
 def handle_one_request(req: dict):
     method = req.get("method")
     params = req.get("params", {}) or {}
@@ -727,6 +1215,44 @@ def handle_one_request(req: dict):
         offset = int(params.get("offset", 0))
         count = int(params.get("count", 100))
         return _get_strings(min_length, offset, count)
+    elif method == "jump_to_address":
+        address = params.get("address")
+        if address is None:
+            return {"error": "address required"}
+        return _jump_to_address(address)
+    elif method == "set_data_type":
+        address = params.get("address")
+        data_type = params.get("data_type")
+        if address is None or data_type is None:
+            return {"error": "address and data_type required"}
+        return _set_data_type(address, data_type)
+    elif method == "set_function_pointer_type":
+        address = params.get("address")
+        function_signature = params.get("function_signature")
+        if address is None or function_signature is None:
+            return {"error": "address and function_signature required"}
+        return _set_function_pointer_type(address, function_signature)
+    elif method == "set_name":
+        address = params.get("address")
+        name = params.get("name")
+        if address is None or name is None:
+            return {"error": "address and name required"}
+        return _set_name(address, name)
+    elif method == "create_function_pointer":
+        address = params.get("address")
+        name = params.get("name")
+        function_signature = params.get("function_signature")
+        if address is None or name is None or function_signature is None:
+            return {"error": "address, name and function_signature required"}
+        return _create_function_pointer(address, name, function_signature)
+    elif method == "create_segment":
+        address = params.get("address")
+        if address is None:
+            return {"error": "address required"}
+        size = params.get("size", 0x1000)
+        name = params.get("name", "created_seg")
+        seg_class = params.get("class", "DATA")
+        return _create_segment(address, size, name, seg_class)
     else:
         return {"error": f"unknown method {method}"}
 
