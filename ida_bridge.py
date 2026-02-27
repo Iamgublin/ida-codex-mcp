@@ -8,6 +8,8 @@ import socket
 import threading
 import json
 import traceback
+import os
+import time
 
 import ida_idaapi
 import ida_kernwin
@@ -30,6 +32,7 @@ except Exception:
 
 HOST = "127.0.0.1"
 PORT = 31337
+BRIDGE_STARTED_AT = int(time.time())
 
 
 # ---------- 工具函数 ----------
@@ -93,6 +96,61 @@ def _list_functions():
         name = ida_funcs.get_func_name(ea)
         funcs.append({"ea": ea, "name": name})
     return funcs
+
+
+def _get_instance_info():
+    """
+    返回当前 IDA 实例信息，供 MCP 侧主动发现与标识
+    """
+    try:
+        idb_path = idc.get_idb_path() or ""
+    except Exception:
+        idb_path = ""
+
+    try:
+        input_file = idc.get_input_file_path() or ""
+    except Exception:
+        input_file = ""
+
+    try:
+        input_file_name = ida_nalt.get_root_filename() or ""
+    except Exception:
+        input_file_name = ""
+
+    try:
+        imagebase = idaapi.get_imagebase()
+    except Exception:
+        imagebase = None
+
+    try:
+        is_64bit = bool(idaapi.inf_is_64bit())
+    except Exception:
+        is_64bit = None
+
+    try:
+        functions_count = int(ida_funcs.get_func_qty())
+    except Exception:
+        try:
+            functions_count = len(list(idautils.Functions()))
+        except Exception:
+            functions_count = None
+
+    return {
+        "ok": True,
+        "bridge": "ida_bridge",
+        "bridge_version": "0.4.0",
+        "pid": os.getpid(),
+        "port": PORT,
+        "started_at": BRIDGE_STARTED_AT,
+        "database_path": idb_path,
+        "database_name": os.path.basename(idb_path) if idb_path else "",
+        "idb_name": os.path.basename(idb_path) if idb_path else "",
+        "input_file": input_file,
+        "input_file_name": input_file_name,
+        "imagebase": imagebase,
+        "is_64bit": is_64bit,
+        "functions_count": functions_count,
+    }
 
 
 def _build_callers_map():
@@ -191,6 +249,92 @@ def _find_function_ea(name):
     return None
 
 
+def _py_exec(code):
+    r"""
+    Execute Python code in IDA's Python interpreter
+    Returns result, output, and any error messages
+    
+    Encoding Note for Comments with Unicode/Chinese Characters:
+    - The 'code' parameter is received as a UTF-8 decoded string from JSON
+    - Non-ASCII characters (e.g., Chinese) are transmitted as \uXXXX escape sequences
+      in JSON (via ensure_ascii=True in mcp_ida_server.py)
+    - Python's compile() and exec() correctly handle Unicode string literals
+    - This ensures idc.set_func_cmt() and cfunc.set_user_cmt() receive proper Unicode
+      strings for comments with Chinese/non-ASCII characters
+    - Example: cfunc.set_user_cmt(tl, '初始化') works because '初始化' is properly
+      decoded from JSON's \u521d\u59cb\u5316 escape sequence
+    
+    Critical: Do NOT manually encode/decode the 'code' parameter - it's already UTF-8
+    decoded. Simply compile and execute it as-is.
+    """
+    import sys
+    from io import StringIO
+    
+    # Capture stdout/stderr
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    captured_output = StringIO()
+    captured_error = StringIO()
+    
+    sys.stdout = captured_output
+    sys.stderr = captured_error
+    
+    result = None
+    error_msg = None
+    
+    try:
+        # Try to compile and execute the code
+        compiled_code = compile(code, "<py_exec>", "exec")
+        
+        # Create a namespace with common IDA modules
+        namespace = {
+            "idaapi": idaapi,
+            "idc": idc,
+            "idautils": idautils,
+            "ida_funcs": ida_funcs,
+            "ida_bytes": ida_bytes,
+            "ida_name": ida_name,
+            "ida_kernwin": ida_kernwin,
+            "ida_lines": ida_lines,
+            "ida_nalt": ida_nalt,
+            "ida_entry": ida_entry,
+        }
+        
+        # Add Hex-Rays if available
+        if HAS_HEXRAYS:
+            namespace["ida_hexrays"] = ida_hexrays
+        
+        # Try eval first (for expressions), then exec (for statements)
+        try:
+            # Try to compile as eval (expression)
+            compiled_eval = compile(code, "<py_exec>", "eval")
+            result = eval(compiled_eval, namespace)
+        except SyntaxError:
+            # Not an expression, use exec for statements
+            exec(compiled_code, namespace)
+            result = None
+            
+    except Exception as e:
+        error_msg = traceback.format_exc()
+    finally:
+        # Restore stdout/stderr
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+    
+    output = captured_output.getvalue()
+    error = captured_error.getvalue()
+    
+    if error:
+        error_msg = (error_msg or "") + "\n" + error
+    
+    return {
+        "result": result,
+        "output": output,
+        "error_msg": error_msg,
+        "ok": error_msg is None
+    }
+
+
 def _get_pseudocode(ea):
     if not HAS_HEXRAYS:
         return {"error": "Hex-Rays not available"}
@@ -205,101 +349,6 @@ def _get_pseudocode(ea):
         "ea": ea,
         "name": ida_funcs.get_func_name(ea),
         "pseudocode": pseudo,
-    }
-
-
-def _set_pseudocode_comment(ea, line, comment, repeatable=False):
-    if not HAS_HEXRAYS:
-        return {"error": "Hex-Rays not available"}
-    try:
-        target_line = int(line)
-    except Exception:
-        return {"error": "line must be an integer"}
-    if target_line <= 0:
-        return {"error": "line must be positive"}
-    try:
-        cfunc = ida_hexrays.decompile(ea)
-    except Exception as exc:
-        return {"error": f"decompile failed: {exc}"}
-    if not cfunc:
-        return {"error": "decompile returned no pseudocode"}
-    
-    # Load existing user comments
-    if hasattr(cfunc, "load_user_cmts"):
-        try:
-            cfunc.load_user_cmts()
-        except Exception:
-            pass
-    
-    # Find the tree location for the target line (1-based input)
-    treeloc = None
-    try:
-        # Get pseudocode lines
-        sv = cfunc.get_pseudocode()
-        if not sv or target_line > len(sv):
-            return {"error": f"line {target_line} out of range (function has {len(sv) if sv else 0} lines)"}
-        
-        # Get the pseudocode line (convert from 1-based to 0-based)
-        pc_line = sv[target_line - 1]
-        
-        # Create treeloc from the pseudocode line's EA
-        if hasattr(pc_line, 'ea') and pc_line.ea != idaapi.BADADDR:
-            treeloc = ida_hexrays.treeloc_t()
-            treeloc.ea = pc_line.ea
-            treeloc.itp = ida_hexrays.ITP_SEMI
-        else:
-            # If no EA, try to find a nearby line with an EA
-            for offset in range(1, min(5, len(sv) - target_line + 1)):
-                check_line = target_line - 1 + offset
-                if check_line < len(sv):
-                    pc_line = sv[check_line]
-                    if hasattr(pc_line, 'ea') and pc_line.ea != idaapi.BADADDR:
-                        treeloc = ida_hexrays.treeloc_t()
-                        treeloc.ea = pc_line.ea
-                        treeloc.itp = ida_hexrays.ITP_SEMI
-                        break
-            
-            # Try before the target line
-            if not treeloc:
-                for offset in range(1, min(5, target_line)):
-                    check_line = target_line - 1 - offset
-                    if check_line >= 0:
-                        pc_line = sv[check_line]
-                        if hasattr(pc_line, 'ea') and pc_line.ea != idaapi.BADADDR:
-                            treeloc = ida_hexrays.treeloc_t()
-                            treeloc.ea = pc_line.ea
-                            treeloc.itp = ida_hexrays.ITP_SEMI
-                            break
-    except Exception as exc:
-        return {"error": f"failed to find tree location: {exc}"}
-    
-    if not treeloc:
-        return {"error": f"could not find tree location for line {target_line}"}
-    
-    # Set the comment using treeloc_t
-    try:
-        cfunc.set_user_cmt(treeloc, comment)
-    except Exception as exc:
-        return {"error": f"failed to set comment: {exc}"}
-    
-    # Save user comments
-    try:
-        cfunc.save_user_cmts()
-    except Exception:
-        pass
-    
-    # Refresh the view
-    if hasattr(ida_hexrays, "refresh_hexrays_view"):
-        try:
-            ida_hexrays.refresh_hexrays_view()
-        except Exception:
-            pass
-    
-    return {
-        "ea": ea,
-        "line": target_line,
-        "comment": comment,
-        "ok": True,
     }
 
 
@@ -1112,7 +1161,18 @@ def _create_function_pointer(address, name, function_signature):
 def handle_one_request(req: dict):
     method = req.get("method")
     params = req.get("params", {}) or {}
-    if method == "list_functions":
+    if method == "ping":
+        return {
+            "ok": True,
+            "bridge": "ida_bridge",
+            "bridge_version": "0.4.0",
+            "pid": os.getpid(),
+            "port": PORT,
+            "started_at": BRIDGE_STARTED_AT,
+        }
+    elif method == "get_instance_info":
+        return _get_instance_info()
+    elif method == "list_functions":
         return _list_functions()
     elif method == "call_graph":
         return _build_call_graph(
@@ -1156,26 +1216,6 @@ def handle_one_request(req: dict):
             except Exception:
                 return {"error": "ea must be an integer"}
         return _get_pseudocode(target_ea)
-    elif method == "add_pseudocode_comment":
-        comment = params.get("comment")
-        line = params.get("line")
-        if comment is None or line is None:
-            return {"error": "comment and line required"}
-        raw_ea = params.get("ea")
-        target_name = params.get("name")
-        if raw_ea is None:
-            if not target_name:
-                return {"error": "name or ea required"}
-            target_ea = _find_function_ea(target_name)
-            if target_ea is None:
-                return {"error": f"function {target_name} not found"}
-        else:
-            try:
-                target_ea = int(raw_ea)
-            except Exception:
-                return {"error": "ea must be an integer"}
-        repeatable = bool(params.get("repeatable", False))
-        return _set_pseudocode_comment(target_ea, line, comment, repeatable)
     elif method == "get_disassembly":
         raw_ea = params.get("ea")
         target_name = params.get("name")
@@ -1253,6 +1293,11 @@ def handle_one_request(req: dict):
         name = params.get("name", "created_seg")
         seg_class = params.get("class", "DATA")
         return _create_segment(address, size, name, seg_class)
+    elif method == "py_exec":
+        code = params.get("code")
+        if not code:
+            return {"error": "code parameter required"}
+        return _py_exec(code)
     else:
         return {"error": f"unknown method {method}"}
 
@@ -1260,12 +1305,33 @@ def handle_one_request(req: dict):
 def serve():
     global PORT
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind((HOST, PORT))
-    except OSError:
-        PORT += 1
-        sock.bind((HOST, PORT))
+    # Windows 下优先独占端口，避免多个 IDA 进程同时绑定同一个端口。
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        except OSError:
+            pass
+    # 非 Windows 保留 REUSEADDR，便于重启后快速复用 TIME_WAIT 端口。
+    if os.name != "nt":
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError:
+            pass
+    max_tries = 100
+    bound = False
+    last_error = None
+    for _ in range(max_tries):
+        try:
+            sock.bind((HOST, PORT))
+            bound = True
+            break
+        except OSError as e:
+            last_error = e
+            PORT += 1
+    if not bound:
+        print(f"[ida-bridge] bind failed after {max_tries} tries: {last_error}")
+        sock.close()
+        return
     sock.listen(5)
     print(f"[ida-bridge] listening on {HOST}:{PORT}")
 

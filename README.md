@@ -2,7 +2,7 @@
 
 Local MCP (Model Context Protocol) server plus an IDA 9.2 plugin to expose common reverse engineering capabilities to MCP clients.
 
-- `ida_bridge.py`: an IDA plugin that exposes core analysis features (function list, call graph, Hex-Rays pseudocode, disassembly, imports/exports, xrefs, strings, memory reads, navigation, naming/typing helpers, etc.) over a local TCP JSON interface (default `127.0.0.1:31337`).
+- `ida_bridge.py`: an IDA plugin that exposes core analysis features (function list, call graph, Hex-Rays pseudocode, disassembly, imports/exports, xrefs, strings, memory reads, etc.) over a local TCP JSON interface (default `127.0.0.1:31337`).
 - `mcp_ida_server.py`: a local MCP server that talks to the IDA plugin, then re-exposes features as MCP tools and resources over STDIN/STDOUT so MCP clients (e.g., Codex CLI) can use them directly.
 
 
@@ -15,7 +15,6 @@ Local MCP (Model Context Protocol) server plus an IDA 9.2 plugin to expose commo
 - Decompile/Disassemble
   - Pseudocode (Hex-Rays): `ida_get_pseudocode(name|ea, offset, limit)`
   - Disassembly: `ida_get_disassembly(name|ea, offset, limit)`
-  - Add pseudocode comment: `ida_add_pseudocode_comment(name|ea, line, comment, repeatable)`
   - Rename function: `ida_rename_function(old_name, new_name)`
 - Program info
   - Imports: `ida_get_imports`
@@ -24,12 +23,20 @@ Local MCP (Model Context Protocol) server plus an IDA 9.2 plugin to expose commo
   - Globals: `ida_list_globals(offset, count)`
   - Memory read: `ida_read_memory(address, size)`
   - Strings: `ida_get_strings(min_length, offset, count)`
-- Navigation & typing
+- Multi-target routing (NEW)
+  - Actively discover running IDA instances: `ida_discover_targets`
+  - List known targets (configured + discovered): `ida_list_targets`
+  - Set active target for subsequent calls: `ida_set_active_target`
+  - Find an API across all targets: `ida_find_function_across_targets`
+  - All `ida_*` tools support optional `ida_target` argument
+  - Route one MCP server to multiple IDA instances (for example `A.dll` and `B.dll`)
+- **Function Pointer Operations (NEW - FIXED v0.2.1)**
   - Jump to address: `ida_jump_to_address(address)`
-  - Set data type: `ida_set_data_type(address, data_type)` (byte/word/dword/qword/float/double/ascii/unicode)
-  - Set function pointer type: `ida_set_function_pointer_type(address, function_signature)` (supports simplified signatures like `NTSTATUS __fastcall`)
-  - Smart name: `ida_set_name(address, name)` (auto-detects function pointers and applies QWORD + function type)
-  - Create function pointer: `ida_create_function_pointer(address, name, function_signature)` (jump + QWORD + function type + name; supports simplified signatures)
+  - Set data type: `ida_set_data_type(address, data_type)` (byte, word, dword, qword, etc.)
+  - Set function pointer type: `ida_set_function_pointer_type(address, function_signature)`
+  - Set name: `ida_set_name(address, name)`
+  - **Complete workflow**: `ida_create_function_pointer(address, name, function_signature)` - converts `MEMORY[address]` calls to named function calls in Hex-Rays
+  - **Recent fixes**: Resolved syntax errors in function signature parsing, added signature normalization, improved fallback types
 - MCP resources
   - `resources/list`: export top functions as resources (first 500)
   - `resources/read`: fetch pseudocode (or fallback to disassembly) via `ida://function/{ea}/{name}`
@@ -68,12 +75,55 @@ ida-codex-mcp/
 python mcp_ida_server.py
 ```
 
-- To override the IDA bridge address/port, set environment variables:
+- To override the IDA bridge address/port (single target), set environment variables:
 
 ```bash
 # Default: 127.0.0.1:31337
 set IDA_HOST=127.0.0.1
 set IDA_PORT=31337
+```
+
+- To connect multiple IDA instances from one MCP server, use:
+
+```bash
+# alias=host:port;alias=host:port
+set IDA_TARGETS=A=127.0.0.1:31337;B=127.0.0.1:31338
+# optional, default is "default"
+set IDA_DEFAULT_TARGET=A
+```
+
+- Then call tools with `ida_target`:
+
+```json
+{"jsonrpc":"2.0","id":"10","method":"tools/call","params":{"name":"ida_list_functions","arguments":{"ida_target":"A"}}}
+{"jsonrpc":"2.0","id":"11","method":"tools/call","params":{"name":"ida_list_functions","arguments":{"ida_target":"B"}}}
+```
+
+- Optional auto-discovery range overrides:
+
+```bash
+set IDA_DISCOVERY_HOST=127.0.0.1
+set IDA_DISCOVERY_PORT_START=31337
+set IDA_DISCOVERY_PORT_END=31437
+set IDA_AUTO_DISCOVER_ON_START=1
+# If MCP process may restart frequently, skip repeated startup scan in this interval (seconds)
+set IDA_STARTUP_DISCOVERY_MIN_INTERVAL_SEC=30
+# Hard budget for startup discovery (seconds). Discovery stops early when budget is reached.
+set IDA_STARTUP_DISCOVERY_TIMEOUT_SEC=4.0
+# Fast TCP connect timeout used for per-port probe (milliseconds, localhost can be very small)
+set IDA_DISCOVERY_CONNECT_TIMEOUT_MS=15
+# Retry timeout for busy IDA UI thread (milliseconds)
+set IDA_DISCOVERY_RETRY_TIMEOUT_MS=1200
+# Optional cache file for discovered targets (restored on next start)
+set IDA_DISCOVERY_CACHE_FILE=C:\temp\ida_mcp_targets_cache.json
+```
+
+- Discovery + locate workflow:
+
+```json
+{"jsonrpc":"2.0","id":"20","method":"tools/call","params":{"name":"ida_discover_targets","arguments":{}}}
+{"jsonrpc":"2.0","id":"21","method":"tools/call","params":{"name":"ida_find_function_across_targets","arguments":{"name":"CreateFileW","match_mode":"exact"}}}
+{"jsonrpc":"2.0","id":"22","method":"tools/call","params":{"name":"ida_set_active_target","arguments":{"ida_target":"B"}}}
 ```
 
 - The process communicates over STDIN/STDOUT. Register it in your MCP client (e.g., Codex CLI) to use tools and resources.
@@ -96,8 +146,10 @@ command = "python"
 # Use an absolute path to the server script; single quotes are safe for Windows paths
 args = ['D:\\Code\\ida-codex-mcp\\mcp_ida_server.py']
 
-# Optional environment overrides (match your IDA bridge address/port)
-env = { IDA_HOST = "127.0.0.1", IDA_PORT = "31337" }
+# Optional environment overrides:
+# - Single target: IDA_HOST + IDA_PORT
+# - Multi target: IDA_TARGETS + IDA_DEFAULT_TARGET
+env = { IDA_TARGETS = "A=127.0.0.1:31337;B=127.0.0.1:31338", IDA_DEFAULT_TARGET = "A" }
 
 # Optional stability knobs
 enabled = true
@@ -113,6 +165,8 @@ type = "stdio"
 command = "python3"
 args = ["/path/to/ida-codex-mcp/mcp_ida_server.py"]
 env = { IDA_HOST = "127.0.0.1", IDA_PORT = "31337" }
+# or:
+# env = { IDA_TARGETS = "A=127.0.0.1:31337;B=127.0.0.1:31338", IDA_DEFAULT_TARGET = "A" }
 enabled = true
 restart_on_exit = true
 timeout_ms = 15000
@@ -169,9 +223,43 @@ Option B: Through MCP (recommended via an MCP client)
 Tip: Sending single JSON lines via a pipe is only for smoke tests—register this process in an MCP client for the best experience.
 
 
+## Function Pointer Workflow Example
+
+The new function pointer tools help convert Hex-Rays pseudocode from this:
+
+```c
+v10 = MEMORY[0xFFFFF803799C3010](a1, a4, 48, 1, 538997579);
+```
+
+To this:
+
+```c
+v10 = SomeApiCall(a1, a4, 48, 1, 538997579);
+```
+
+**Method 1: Manual steps**
+1. `ida_jump_to_address(address=0xFFFFF803799C3010)` - Jump to the address
+2. `ida_set_data_type(address=0xFFFFF803799C3010, data_type="qword")` - Set as 8-byte pointer
+3. `ida_set_function_pointer_type(address=0xFFFFF803799C3010, function_signature="NTSTATUS (__fastcall *)(void *, void *, int, int, int)")` - Set function pointer type
+4. `ida_set_name(address=0xFFFFF803799C3010, name="SomeApiCall")` - Give it a name
+
+**Method 2: One-step workflow**
+```
+ida_create_function_pointer(
+  address=0xFFFFF803799C3010,
+  name="SomeApiCall", 
+  function_signature="NTSTATUS (__fastcall *)(void *, void *, int, int, int)"
+)
+```
+
+This performs all steps automatically and refreshes the Hex-Rays view.
+
 ## FAQ
 
-- If Hex-Rays is not installed, `ida_get_pseudocode` and `ida_add_pseudocode_comment` will error; use `ida_get_disassembly` instead.
+- If Hex-Rays is not installed, `ida_get_pseudocode` will error; use `ida_get_disassembly` instead.
+- To add pseudocode comments, use `ida_py_exec` to call IDA's Python API (e.g., `ida_hexrays` / `idc.set_cmt`) directly.
+- Function pointer operations require the address to be mapped in IDA's address space.
+- Function signatures should follow standard C function pointer syntax: `return_type (__calling_convention *)(param_types)`
 - If port `31337` is occupied, the plugin increases the port number automatically; set `IDA_PORT` accordingly on the MCP side to match.
 - Transport encoding is UTF-8; each request/response is a single JSON line ending with a newline.
 
