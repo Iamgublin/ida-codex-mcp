@@ -950,10 +950,7 @@ def handle_tools_list(req: dict):
                         "description": "Maximum number of lines to return. If not specified, returns all lines. Use for pagination of large functions.",
                     },
                 },
-                "anyOf": [
-                    {"required": ["name"]},
-                    {"required": ["ea"]}
-                ],
+                "description": "Provide at least one of 'name' or 'ea'. Runtime validation enforces this because OpenAI function schemas reject top-level anyOf/oneOf.",
             },
         },
         {
@@ -980,10 +977,7 @@ def handle_tools_list(req: dict):
                         "description": "Maximum number of lines to return. If not specified, returns all lines. Use for pagination of large functions.",
                     },
                 },
-                "anyOf": [
-                    {"required": ["name"]},
-                    {"required": ["ea"]}
-                ],
+                "description": "Provide at least one of 'name' or 'ea'. Runtime validation enforces this because OpenAI function schemas reject top-level anyOf/oneOf.",
             },
         },
         {
