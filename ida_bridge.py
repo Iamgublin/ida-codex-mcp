@@ -1345,8 +1345,13 @@ def serve():
             data += chunk
             if b"\n" in chunk:
                 break
+        text = data.decode("utf-8", "ignore").strip()
+        if not text:
+            conn.close()
+            continue
+
         try:
-            req = json.loads(data.decode("utf-8").strip())
+            req = json.loads(text)
 
             def _do():
                 try:
@@ -1357,6 +1362,13 @@ def serve():
                 conn.close()
 
             ida_kernwin.execute_sync(_do, ida_kernwin.MFF_FAST)
+        except json.JSONDecodeError as e:
+            try:
+                res = {"error": f"bad json request: {e}"}
+                conn.sendall((json.dumps(res) + "\n").encode("utf-8"))
+            except Exception:
+                pass
+            conn.close()
         except Exception:
             traceback.print_exc()
             conn.close()
